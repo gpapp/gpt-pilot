@@ -93,7 +93,7 @@ def test_api_access(project) -> bool:
 def create_gpt_chat_completion(messages: List[dict], req_type, project,
                                function_calls: FunctionCallSet = None,
                                prompt_data: dict = None,
-                               temperature: float = 0.7):
+                               temperature: float = -1):  
     """
     Called from:
       - AgentConvo.send_message() - these calls often have `function_calls`, usually from `pilot/const/function_calls.py`
@@ -108,22 +108,32 @@ def create_gpt_chat_completion(messages: List[dict], req_type, project,
         or if `function_calls` param provided
              {'function_calls': {'name': str, arguments: {...}}}
     """
+    if (temperature < 0.0): 
+        temperature = float(os.getenv('TEMPERATURE', 0.7))
 
     model_name = os.getenv('MODEL_NAME', 'gpt-4')
+    if '/' in model_name:
+        model_provider, model_name = model_name.split('/', 1)
+    else:
+        model_provider = 'openai'
+
     gpt_data = {
         'model': model_name,
-        'n': 1,
+        'n': os.getenv('N', 1),
         'temperature': temperature,
-        'top_p': 1,
-        'presence_penalty': 0,
-        'frequency_penalty': 0,
+        'top_p': float(os.getenv('TOP_P', 1)),
+        'top_k': float(os.getenv('TOP_K', 0)),
+        'repetition_penalty': float(os.getenv('REPETITION_PENALTY', 1)),
+        'presence_penalty': float(os.getenv('PRESENCE_PENALTY', 0)),
+        'frequency_penalty': float(os.getenv('FREQUENCY_PENALTY', 0)),
+        'guidance_scale': float(os.getenv('GUIDANCE_SCALE', 1.5)),
         'messages': messages,
         'stream': True
     }
 
     # delete some keys if using "OpenRouter" API
     if os.getenv('ENDPOINT') == 'OPENROUTER':
-        keys_to_delete = ['n', 'max_tokens', 'temperature', 'top_p', 'presence_penalty', 'frequency_penalty']
+        keys_to_delete = ['n', 'max_tokens', 'temperature', 'top_p', 'top_k', 'repetition_penalty', 'presence_penalty', 'frequency_penalty', 'guidance_scale']
         for key in keys_to_delete:
             if key in gpt_data:
                 del gpt_data[key]
@@ -132,15 +142,12 @@ def create_gpt_chat_completion(messages: List[dict], req_type, project,
     messages_length = len(messages)
     function_call_message = add_function_calls_to_request(gpt_data, function_calls)
     if prompt_data is not None and function_call_message is not None:
-        prompt_data['function_call_message'] = function_call_message
-
-    if '/' in model_name:
-        model_provider, model_name = model_name.split('/', 1)
-    else:
-        model_provider = 'openai'
+        prompt_data['function_call_message'] = function_call_message        
 
     try:
-        if model_provider == 'anthropic' and os.getenv('ENDPOINT') != 'OPENROUTER':
+        if model_provider == 'groq' and os.getenv('ENDPOINT') != 'OPENROUTER':
+            response = stream_groq(gpt_data, req_type, project)
+        elif model_provider == 'anthropic' and os.getenv('ENDPOINT') != 'OPENROUTER':
             if not os.getenv('ANTHROPIC_API_KEY'):
                 os.environ['ANTHROPIC_API_KEY'] = os.getenv('OPENAI_API_KEY')
             response = stream_anthropic(messages, function_call_message, gpt_data, model_name)
@@ -651,6 +658,62 @@ def stream_anthropic(messages, function_call_message, gpt_data, model_name = "cl
 
     return {"text": response}
 
+def stream_groq(data, req_type, project):
+    try:
+        from groq import Groq
+    except ImportError as err:
+        raise RuntimeError("The 'groq' package is required to use the Groq LLM.") from err
+
+    client = Groq(
+        # This is the default and can be omitted
+        # api_key=os.environ.get("GROQ_API_KEY"),
+        # base_url=os.environ.get("GROQ_BASE_URL"),
+        timeout=(API_CONNECT_TIMEOUT, API_READ_TIMEOUT),        
+    )
+
+    response=""
+    if (data.get("response_format",)):
+        response=client.chat.completions.create(
+            messages=data["messages"],
+            model=data.get("model","mixtral-8x7b-32768"),
+            n=data.get("n",1),
+            temperature=data.get("temperature",0.7),
+            top_p=data.get("top_p",1.0),
+            frequency_penalty=data.get("frequency_penalty",1),
+            presence_penalty=data.get("presence_penalty",0),        
+            max_tokens=data.get("max_tokens",4096),
+            response_format=data.get("response_format",),
+            stream=False
+        ).choices[0].message.content;
+    else:
+        with client.chat.completions.with_streaming_response.create(        
+            messages=data["messages"],
+            model=data.get("model","mixtral-8x7b-32768"),
+            n=data.get("n",1),
+            temperature=data.get("temperature",0.7),
+            top_p=data.get("top_p",1.0),
+            frequency_penalty=data.get("frequency_penalty",),
+            presence_penalty=data.get("presence_penalty",0),        
+            max_tokens=data.get("max_tokens",4096),
+            stream=True
+        ) as stream:
+            for chunk in stream.iter_lines():
+                if chunk=='':
+                    continue
+                if chunk!='[DONE]':
+                    o=json.loads(chunk.split(': ', 1)[1])
+                    if (o['choices'][0]['finish_reason']=='stop'):
+                        print ('\n', type='stream')
+                        response+='\n'
+                        break
+                    print (o['choices'][0]['delta']['content'],type='stream',end='', flush=True)
+                    response+=o['choices'][0]['delta']['content']
+    
+    return {"text": response}
+
+
+
+=======
 
 def fix_numbers(data, schema):
 
